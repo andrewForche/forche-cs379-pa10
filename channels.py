@@ -1,93 +1,138 @@
-"""
-PA 10: Channels -- starter (final PA of the semester).
+﻿"""PA 10: bounded FIFO channels carrying reference-counted heap handles."""
 
-Complete Channel below, plus the producer/consumer driver at the
-bottom. See the assignment, Part B, for the full requirements.
-Values passed through the channel are GCHeap handles (ints) -- see
-gc_heap.py.
-"""
-
+from collections import deque
 import threading
-from typing import Any, Optional
 
 from gc_heap import GCHeap
 
-_CLOSED_SENTINEL = object()
-
 
 class Channel:
-    def __init__(self, capacity: int, heap: GCHeap) -> None:
-        # TODO: internal buffer (a deque or list works), a threading.Condition,
-        # and a "closed" flag.
-        raise NotImplementedError
+    CLOSED = object()
 
-    def put(self, value: Any) -> None:
+    def __init__(self, capacity: int, heap: GCHeap) -> None:
+        if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity <= 0:
+            raise ValueError("Channel capacity must be a positive integer.")
+        self._capacity = capacity
+        self._heap = heap
+        self._buffer = deque()
+        self._closed = False
+        # The PA9 heap has no internal lock. The driver also uses this lock
+        # for heap operations so they cannot race with put's incref.
+        self._lock = threading.Lock()
+        self._not_empty = threading.Condition(self._lock)
+        self._not_full = threading.Condition(self._lock)
+
+    def put(self, value: int) -> None:
+        """Wait for space, then acquire and buffer one reference to a handle.
+
+        The caller retains its reference, including when a closed put fails.
         """
-        Block while the buffer is full. `value` is expected to be a
-        GCHeap handle -- incref it (the channel now holds a reference)
-        BEFORE enqueuing. Wake a waiting get() once space is available.
-        """
-        # TODO
-        raise NotImplementedError
+        with self._not_full:
+            while len(self._buffer) >= self._capacity and not self._closed:
+                self._not_full.wait()
+            if self._closed:
+                raise RuntimeError("Cannot put on a closed channel.")
+            self._heap.incref(value)
+            self._buffer.append(value)
+            self._not_empty.notify()
 
     def get(self):
+        """Transfer the oldest buffered reference, or return CLOSED once drained.
+
+        The caller must eventually decref the returned handle.
         """
-        Block while the buffer is empty (and not closed). Returns the
-        next value, transferring the channel's reference to the
-        caller (do NOT decref here -- the caller now owns that
-        reference and is responsible for eventually releasing it).
-        On an empty, closed channel, return the sentinel from
-        `Channel.CLOSED` instead of blocking forever.
-        """
-        # TODO
-        raise NotImplementedError
+        with self._not_empty:
+            while not self._buffer and not self._closed:
+                self._not_empty.wait()
+            if not self._buffer:
+                return self.CLOSED
+            handle = self._buffer.popleft()
+            self._not_full.notify()
+            return handle
 
     def close(self) -> None:
-        """Mark closed and wake every blocked thread."""
-        # TODO
-        raise NotImplementedError
+        """Wake every waiter and preserve buffered references for draining."""
+        with self._not_empty:
+            self._closed = True
+            self._not_empty.notify_all()
+            self._not_full.notify_all()
 
-    CLOSED = _CLOSED_SENTINEL
 
+def producer_consumer_driver(
+    heap: GCHeap, values: list, channel: Channel, num_consumers: int = 1
+):
+    """Allocate and deliver values using one producer and one or more consumers.
 
-def producer_consumer_driver(heap: GCHeap, values: list, channel: Channel, num_consumers: int = 1):
+    Return (handle, value) pairs in consumer recording order. With multiple
+    consumers this order may differ from FIFO dequeue order. Every worker is
+    joined, and worker errors are propagated after closing and draining.
     """
-    Given: a driver you can use as-is (or adapt) for your own testing.
-    One producer thread allocates + puts each value in `values` onto
-    `channel`, then closes it. `num_consumers` consumer threads pull
-    handles off, look up and record their value, then release their
-    transferred reference, exiting cleanly on the CLOSED sentinel.
-    Returns the list of delivered (handle, value) pairs.
-    """
+    if (not isinstance(num_consumers, int) or isinstance(num_consumers, bool)
+            or num_consumers <= 0):
+        raise ValueError("The driver needs at least one consumer.")
+    if channel._heap is not heap:
+        raise ValueError("The driver and channel must share the same heap.")
+
     delivered = []
-    delivered_lock = threading.Lock()
+    errors = []
+    result_lock = threading.Lock()
+
+    def record_error(error):
+        with result_lock:
+            errors.append(error)
+        channel.close()
 
     def produce():
-        for v in values:
-            handle = heap.allocate(v)
-            try:
-                channel.put(handle)
-            finally:
-                heap.decref(handle)  # release the creator reference
-        channel.close()
+        try:
+            for value in values:
+                with channel._lock:
+                    handle = heap.allocate(value)
+                try:
+                    channel.put(handle)
+                finally:
+                    # Release the creator reference on success, or clean up
+                    # our allocation if put failed without taking ownership.
+                    with channel._lock:
+                        heap.decref(handle)
+        except Exception as error:
+            record_error(error)
+        finally:
+            channel.close()
 
     def consume():
         while True:
             handle = channel.get()
             if handle is Channel.CLOSED:
                 return
-            value = heap._objects[handle][0]  # PA 9 stores [object, refcount]
-            with delivered_lock:
-                delivered.append((handle, value))
-            heap.decref(handle)  # the consumer is done with its transferred reference
+            try:
+                try:
+                    with channel._lock:
+                        value = heap._objects[handle][0]
+                    with result_lock:
+                        delivered.append((handle, value))
+                finally:
+                    with channel._lock:
+                        heap.decref(handle)
+            except Exception as error:
+                # Closing stops production; keep draining owned references.
+                record_error(error)
 
     producer_thread = threading.Thread(target=produce)
     consumer_threads = [threading.Thread(target=consume) for _ in range(num_consumers)]
-    for t in [producer_thread] + consumer_threads:
-        t.start()
+    for thread in consumer_threads:
+        thread.start()
+    producer_thread.start()
     producer_thread.join()
-    for t in consumer_threads:
-        t.join(timeout=10.0)
-
+    for thread in consumer_threads:
+        thread.join()
+    if errors:
+        raise errors[0]
     return delivered
 
+
+if __name__ == "__main__":
+    heap = GCHeap()
+    channel = Channel(capacity=2, heap=heap)
+    delivered = producer_consumer_driver(heap, list(range(10)), channel, num_consumers=2)
+    print(f"Processed {len(delivered)} values; sum = {sum(v for _, v in delivered)}")
+    print(f"Live heap objects after completion: {heap.live_count()}")
